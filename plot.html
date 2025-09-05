@@ -83,6 +83,11 @@
             text-align: left;
             margin-left: 10px;
         }
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
@@ -116,6 +121,15 @@
             <div class="slider-container"><label>Scale U:</label><input type="range" id="p2_scale_u" min="0.1" max="2" step="0.01" value="0.7"><span class="value-display" id="p2_scale_u_val">0.70</span></div>
             <div class="slider-container"><label>Scale V:</label><input type="range" id="p2_scale_v" min="0.1" max="2" step="0.01" value="0.3"><span class="value-display" id="p2_scale_v_val">0.30</span></div>
         </div>
+        <div class="slider-group">
+            <h3 class="text-gray-300">Visualization Aids</h3>
+            <div class="checkbox-container">
+                <input type="checkbox" id="show_normals" checked class="mr-2"><label for="show_normals">Show Normal Vectors (t_z)</label>
+            </div>
+            <div class="checkbox-container">
+                <input type="checkbox" id="show_samples" checked class="mr-2"><label for="show_samples">Show Regularization Points</label>
+            </div>
+        </div>
         <p class="text-xs text-gray-400 mt-4">Use mouse to control camera: Left-click + Drag = Rotate, Right-click + Drag = Pan, Scroll = Zoom.</p>
     </div>
 
@@ -134,11 +148,9 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-        // --- GLOBAL SETUP ---
         let scene, camera, renderer, controls;
         let primitive1, primitive2;
 
-        // A simple colormap function (viridis) to color points by Gaussian value
         function viridis(value) {
             const colors = [
                 [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142],
@@ -159,172 +171,156 @@
         class GaussianPrimitive {
             constructor(initialParams) {
                 this.params = initialParams;
-                this.nPoints = 50 * 50; // Resolution of the disk
                 
-                // Pre-calculate the local 2D grid (u,v space)
+                // --- Main Gaussian Disk ---
+                this.nGridPoints = 50 * 50;
                 const u_coords = np.linspace(-2.5, 2.5, 50);
                 const v_coords = np.linspace(-2.5, 2.5, 50);
-
-                // FIX: The original code had a TypeError because JS arrays don't have .ravel()
-                // It also had a logical error by trying to perform math operations on entire arrays at once.
-                // The corrected code gets the flattened arrays from meshgrid and then loops to calculate values per point.
                 const [u, v] = np.meshgrid(u_coords, v_coords);
                 this.uv = { u, v };
-
-                // Pre-calculate Gaussian values (colors) as they don't change
-                this.gaussianValues = new Float32Array(this.nPoints);
-                for (let i = 0; i < this.nPoints; i++) {
-                    const distance_sq = this.uv.u[i]**2 + this.uv.v[i]**2;
-                    this.gaussianValues[i] = Math.exp(-distance_sq / 2.0);
-                }
-
-                // Create Three.js objects
+                
                 this.geometry = new THREE.BufferGeometry();
                 this.material = new THREE.PointsMaterial({ size: 0.05, vertexColors: true });
                 this.points = new THREE.Points(this.geometry, this.material);
                 
+                // --- Normal Vector (t_z) ---
+                this.normalArrow = new THREE.ArrowHelper(new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,0), 1, 0xffffff);
+
+                // --- DGPR Sampled Points ---
+                this.nSamplePoints = 9;
+                const sample_coords = [-1.0, 0.0, 1.0];
+                const [su, sv] = np.meshgrid(sample_coords, sample_coords);
+                this.sample_uv = { u: su, v: sv };
+                this.sampleGeometry = new THREE.BufferGeometry();
+                this.sampleMaterial = new THREE.PointsMaterial({ color: 0xff0000, size: 0.08 });
+                this.samplePoints = new THREE.Points(this.sampleGeometry, this.sampleMaterial);
+
                 this.update();
             }
 
             update() {
-                // Deconstruct parameters
                 const p = new THREE.Vector3(...this.params.position);
                 const euler = new THREE.Euler(
                     THREE.MathUtils.degToRad(this.params.rotation[1]), // Pitch (Y)
                     THREE.MathUtils.degToRad(this.params.rotation[0]), // Yaw (Z)
                     THREE.MathUtils.degToRad(this.params.rotation[2]), // Roll (X)
-                    'YZX' // Order of rotation
+                    'YZX'
                 );
                 const s = this.params.scale;
-
-                // Create rotation matrix from Euler angles
                 const rotationMatrix = new THREE.Matrix4().makeRotationFromEuler(euler);
                 
-                // Extract tangential vectors t_u and t_v
                 const t_u = new THREE.Vector3().setFromMatrixColumn(rotationMatrix, 0);
                 const t_v = new THREE.Vector3().setFromMatrixColumn(rotationMatrix, 1);
+                const t_z = new THREE.Vector3().setFromMatrixColumn(rotationMatrix, 2); // The normal vector
+
+                // --- FIX: This section now filters points to form a disk ---
+                const positions = [];
+                const colors = [];
+                const radiusSq = 2.5 * 2.5; // We will only draw points within this radius
                 
-                const positions = new Float32Array(this.nPoints * 3);
-                const colors = new Float32Array(this.nPoints * 3);
-                
-                for (let i = 0; i < this.nPoints; i++) {
-                    // P(u, v) = p + s_u*t_u*u + s_v*t_v*v
+                for (let i = 0; i < this.nGridPoints; i++) {
                     const u = this.uv.u[i];
                     const v = this.uv.v[i];
-                    
-                    const pos = new THREE.Vector3()
-                        .copy(p)
-                        .addScaledVector(t_u, s[0] * u)
-                        .addScaledVector(t_v, s[1] * v);
-                    
-                    pos.toArray(positions, i * 3);
-                    
-                    // Color based on Gaussian value
-                    const color = viridis(this.gaussianValues[i]);
-                    color.toArray(colors, i * 3);
-                }
+                    const distance_sq = u**2 + v**2;
 
-                this.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    if (distance_sq < radiusSq) { // Only add points if they are inside the circle
+                        const pos = new THREE.Vector3().copy(p).addScaledVector(t_u, s[0] * u).addScaledVector(t_v, s[1] * v);
+                        positions.push(pos.x, pos.y, pos.z);
+                        
+                        const gaussianValue = Math.exp(-distance_sq / 2.0);
+                        const color = viridis(gaussianValue);
+                        colors.push(color.r, color.g, color.b);
+                    }
+                }
+                
+                this.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                this.geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
                 this.geometry.attributes.position.needsUpdate = true;
                 this.geometry.attributes.color.needsUpdate = true;
+                // --- END FIX ---
+                
+                // Update normal vector arrow
+                this.normalArrow.position.copy(p);
+                this.normalArrow.setDirection(t_z);
+                
+                // Update DGPR sample points
+                const samplePositions = new Float32Array(this.nSamplePoints * 3);
+                 for (let i = 0; i < this.nSamplePoints; i++) {
+                    const pos = new THREE.Vector3().copy(p).addScaledVector(t_u, s[0] * this.sample_uv.u[i]).addScaledVector(t_v, s[1] * this.sample_uv.v[i]);
+                    pos.toArray(samplePositions, i * 3);
+                }
+                this.sampleGeometry.setAttribute('position', new THREE.BufferAttribute(samplePositions, 3));
+                this.sampleGeometry.attributes.position.needsUpdate = true;
             }
         }
         
-        // Helper for numpy-like linspace and meshgrid
         const np = {
             linspace: (start, stop, num) => Array.from({ length: num }, (_, i) => start + (stop - start) * i / (num - 1)),
-            meshgrid: (x, y) => [
-                x.map(v => Array(y.length).fill(v)),
-                Array(x.length).fill(y)
-            ].map(arr => arr.flat())
+            meshgrid: (x, y) => [ x.map(v => Array(y.length).fill(v)), Array(x.length).fill(y) ].map(arr => arr.flat())
         };
 
         function init() {
-            // Scene
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x1a202c);
-
-            // Camera
             camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
             camera.position.set(1.5, 2, 4);
-
-            // Renderer
             const container = document.getElementById('scene-container');
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             container.appendChild(renderer.domElement);
-
-            // Controls
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
-
-            // Lights
             const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
             scene.add(ambientLight);
             const directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
             directionalLight.position.set(5, 10, 7.5);
             scene.add(directionalLight);
-            
-            // Add Grid Helper
             const gridHelper = new THREE.GridHelper(10, 10, 0x4a5568, 0x3a4558);
             scene.add(gridHelper);
 
-            // Create Primitives
-            primitive1 = new GaussianPrimitive({
-                position: [0, 0.5, 0],
-                rotation: [0, 0, 0], // Yaw, Pitch, Roll
-                scale: [0.5, 0.5] // su, sv
-            });
-            scene.add(primitive1.points);
+            // Create Primitives and add all their components to the scene
+            primitive1 = new GaussianPrimitive({ position: [0, 0.5, 0], rotation: [0, 0, 0], scale: [0.5, 0.5] });
+            scene.add(primitive1.points, primitive1.normalArrow, primitive1.samplePoints);
 
-            primitive2 = new GaussianPrimitive({
-                position: [1.5, 0.5, 0],
-                rotation: [45, 30, 0],
-                scale: [0.7, 0.3]
-            });
-            scene.add(primitive2.points);
+            primitive2 = new GaussianPrimitive({ position: [1.5, 0.5, 0], rotation: [45, 30, 0], scale: [0.7, 0.3] });
+            scene.add(primitive2.points, primitive2.normalArrow, primitive2.samplePoints);
             
             setupUI();
             animate();
         }
 
         function setupUI() {
-            const primitives = [
-                { id: 'p1', instance: primitive1 },
-                { id: 'p2', instance: primitive2 }
-            ];
+            const primitives = [ { id: 'p1', instance: primitive1 }, { id: 'p2', instance: primitive2 } ];
 
             primitives.forEach(p => {
                 const update = () => {
-                    const pos_x = parseFloat(document.getElementById(`${p.id}_pos_x`).value);
-                    const pos_y = parseFloat(document.getElementById(`${p.id}_pos_y`).value);
-                    const pos_z = parseFloat(document.getElementById(`${p.id}_pos_z`).value);
-                    const rot_y = parseFloat(document.getElementById(`${p.id}_rot_y`).value);
-                    const rot_p = parseFloat(document.getElementById(`${p.id}_rot_p`).value);
-                    const rot_r = parseFloat(document.getElementById(`${p.id}_rot_r`).value);
-                    const scale_u = parseFloat(document.getElementById(`${p.id}_scale_u`).value);
-                    const scale_v = parseFloat(document.getElementById(`${p.id}_scale_v`).value);
-
-                    p.instance.params.position = [pos_x, pos_y, pos_z];
-                    p.instance.params.rotation = [rot_y, rot_p, rot_r];
-                    p.instance.params.scale = [scale_u, scale_v];
+                    p.instance.params.position = [parseFloat(document.getElementById(`${p.id}_pos_x`).value), parseFloat(document.getElementById(`${p.id}_pos_y`).value), parseFloat(document.getElementById(`${p.id}_pos_z`).value)];
+                    p.instance.params.rotation = [parseFloat(document.getElementById(`${p.id}_rot_y`).value), parseFloat(document.getElementById(`${p.id}_rot_p`).value), parseFloat(document.getElementById(`${p.id}_rot_r`).value)];
+                    p.instance.params.scale = [parseFloat(document.getElementById(`${p.id}_scale_u`).value), parseFloat(document.getElementById(`${p.id}_scale_v`).value)];
                     p.instance.update();
-                    
-                    document.getElementById(`${p.id}_pos_x_val`).textContent = pos_x.toFixed(2);
-                    document.getElementById(`${p.id}_pos_y_val`).textContent = pos_y.toFixed(2);
-                    document.getElementById(`${p.id}_pos_z_val`).textContent = pos_z.toFixed(2);
-                    document.getElementById(`${p.id}_rot_y_val`).textContent = rot_y;
-                    document.getElementById(`${p.id}_rot_p_val`).textContent = rot_p;
-                    document.getElementById(`${p.id}_rot_r_val`).textContent = rot_r;
-                    document.getElementById(`${p.id}_scale_u_val`).textContent = scale_u.toFixed(2);
-                    document.getElementById(`${p.id}_scale_v_val`).textContent = scale_v.toFixed(2);
+                    document.getElementById(`${p.id}_pos_x_val`).textContent = p.instance.params.position[0].toFixed(2);
+                    document.getElementById(`${p.id}_pos_y_val`).textContent = p.instance.params.position[1].toFixed(2);
+                    document.getElementById(`${p.id}_pos_z_val`).textContent = p.instance.params.position[2].toFixed(2);
+                    document.getElementById(`${p.id}_rot_y_val`).textContent = p.instance.params.rotation[0];
+                    document.getElementById(`${p.id}_rot_p_val`).textContent = p.instance.params.rotation[1];
+                    document.getElementById(`${p.id}_rot_r_val`).textContent = p.instance.params.rotation[2];
+                    document.getElementById(`${p.id}_scale_u_val`).textContent = p.instance.params.scale[0].toFixed(2);
+                    document.getElementById(`${p.id}_scale_v_val`).textContent = p.instance.params.scale[1].toFixed(2);
                 };
-
                 ['pos_x', 'pos_y', 'pos_z', 'rot_y', 'rot_p', 'rot_r', 'scale_u', 'scale_v'].forEach(param => {
                     document.getElementById(`${p.id}_${param}`).addEventListener('input', update);
                 });
+            });
+            
+            // Event listeners for the visualization aid checkboxes
+            document.getElementById('show_normals').addEventListener('change', (e) => {
+                primitive1.normalArrow.visible = e.target.checked;
+                primitive2.normalArrow.visible = e.target.checked;
+            });
+            document.getElementById('show_samples').addEventListener('change', (e) => {
+                primitive1.samplePoints.visible = e.target.checked;
+                primitive2.samplePoints.visible = e.target.checked;
             });
         }
 
@@ -341,7 +337,6 @@
         }
 
         window.addEventListener('resize', onWindowResize);
-
         init();
     </script>
 </body>
